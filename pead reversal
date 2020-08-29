@@ -1,0 +1,96 @@
+"""
+PEAD Reversal Strategy
+"""
+import numpy as np
+import pandas as pd
+ 
+from zipline.utils import tradingcalendar
+from quantopian.pipeline import CustomFactor, Pipeline
+from quantopian.algorithm import attach_pipeline, pipeline_output
+from quantopian.pipeline.data.builtin import USEquityPricing
+from quantopian.pipeline.factors import AverageDollarVolume
+from quantopian.pipeline.filters.morningstar import Q500US, Q1500US
+from quantopian.pipeline.classifiers.morningstar import Sector
+from quantopian.pipeline.data.zacks import EarningsSurprises
+from quantopian.pipeline.factors.eventvestor import (
+BusinessDaysUntilNextEarnings,
+BusinessDaysSincePreviousEarnings
+)
+from quantopian.pipeline.data.eventvestor import EarningsCalendar
+ 
+def initialize(context):
+    """
+    Called once at the start of the algorithm.
+    """   
+    context.leverage = 1.0
+    context.DAYS_TO_HOLD = 6
+    context.MAX_DAYS_TO_HOLD = 6
+    context.MAX_IN_ONE = 1.
+    
+    context.longs = {}
+    context.shorts = {}
+    
+    schedule_function(rebalance, date_rules.every_day(), time_rules.market_open())
+    schedule_function(record_vars, date_rules.every_day(), time_rules.market_close())
+ 
+    attach_pipeline(create_pipeline(Q500US()), 'pipe')
+                
+def create_pipeline(mask):
+    # Earnings Surprise Factor from previous quarter
+    lag_e_surp = EarningsSurprises.eps_pct_diff_surp.latest
+    
+    # Filters 
+    top_dec = lag_e_surp.percentile_between(90, 100, mask=mask)
+    bottom_dec = lag_e_surp.percentile_between(0,10, mask=mask)
+    has_announcement = BusinessDaysUntilNextEarnings().eq(1)
+    mask = has_announcement & mask & (top_dec | bottom_dec)
+    
+    return Pipeline(columns= {
+                        'LagESurp': lag_e_surp,
+                        'top_dec': top_dec,
+                        'bottom_dec': bottom_dec
+                    },
+                    screen=mask)
+ 
+def before_trading_start(context, data):
+    """
+    Called every day before market open.
+    """
+    context.output = pipeline_output('pipe')
+    
+    # Discard stocks which have been held for > Hold Period
+    context.longs = {k:v+1 for k,v in context.longs.items() if v < context.DAYS_TO_HOLD}
+    context.shorts = {k:v+1 for k,v in context.shorts.items() if v < context.DAYS_TO_HOLD}
+    
+    # Add new stocks which pass our pipeline filter
+    for stock in context.output.index[context.output['bottom_dec'] == True]:
+        context.longs[stock] = 0
+    
+    for stock in context.output.index[context.output['top_dec'] == True]:
+        context.shorts[stock] = 0
+ 
+def rebalance(context, data):
+    short_list = context.shorts
+    long_list = context.longs
+    
+    # Rebalance our shorts, weighted equally
+    for equity in short_list:
+        if data.can_trade(equity):
+            order_target_percent(equity, -min(0.3 / len(short_list), context.MAX_IN_ONE))
+            
+    # Rebalance our longs, weighted equally
+    for equity in long_list:
+        if data.can_trade(equity):
+            order_target_percent(equity, min(0.7 / len(long_list), context.MAX_IN_ONE))
+ 
+    # Close positions which have been held for > Hold Period
+    for position in context.portfolio.positions:
+        if position not in context.shorts.keys() + context.longs.keys():
+            order_target_percent(position, 0)
+            
+            
+def record_vars(context, data):
+    """
+    Plot variables at the end of each day.
+    """
+    record(leverage=context.account.leverage)
